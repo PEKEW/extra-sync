@@ -1,0 +1,10 @@
+{
+  "name": "extra-sync",
+  "version": "0.1.0",
+  "description": "Sync skills, plugins, and configurations across agents via ~/.agents-config",
+  "author": {
+    "name": "peke"
+  },
+  "license": "MIT",
+  "keywords": ["sync", "skills", "plugins", "agents-config"]
+}

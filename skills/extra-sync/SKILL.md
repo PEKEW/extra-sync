@@ -23,7 +23,7 @@ Run the sync script and present the results clearly.
 Run the sync script. If the user provided arguments (e.g., `--skills`, `--plugins`, `--remote`, `--report`), pass them through. Otherwise, use `--all`.
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/sync.sh" --all 2>&1
+bash "$HOME/.agents-config/special/claude/plugins/extra-sync/scripts/sync.sh" --all 2>&1
 ```
 
 ### Step 2: Present results

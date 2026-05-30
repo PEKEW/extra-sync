@@ -94,34 +94,41 @@ sync_skills() {
 
   mkdir -p "$skills_dir"
 
-  # Check and fix symlinks
-  local links=(
-    "common:$common_src"
-    "local:$special_src"
-    "special:$special_src"
-  )
+  # Claude Code only scans skills one level deep (~/.claude/skills/<name>/SKILL.md),
+  # so each skill dir must be linked individually. Linking a parent dir (common/
+  # local/special) buries skills two levels deep where CC never finds them.
 
-  for entry in "${links[@]}"; do
-    local name="${entry%%:*}"
-    local target="${entry#*:}"
-    local link_path="$skills_dir/$name"
+  # Remove legacy parent-dir symlinks from older versions.
+  for legacy in common local special; do
+    local legacy_path="$skills_dir/$legacy"
+    if [ -L "$legacy_path" ]; then
+      rm "$legacy_path"
+      log_warn "Removed legacy parent symlink skills/$legacy"
+    fi
+  done
+
+  # Link each skill dir into ~/.claude/skills/<name>.
+  for skill_dir in "$common_src"/*/ "$special_src"/*/; do
+    [ -d "$skill_dir" ] || continue
+    skill_dir="${skill_dir%/}"
+    [ -f "$skill_dir/SKILL.md" ] || continue
+    local name link_path
+    name=$(basename "$skill_dir")
+    link_path="$skills_dir/$name"
 
     if [ -L "$link_path" ]; then
-      local current_target
-      current_target=$(readlink "$link_path")
-      if [ "$current_target" = "$target" ]; then
-        log_ok "Symlink $name -> $target"
+      if [ "$(readlink "$link_path")" = "$skill_dir" ]; then
+        log_ok "Symlink $name -> $skill_dir"
       else
         rm "$link_path"
-        ln -s "$target" "$link_path"
-        log_warn "Fixed symlink $name: $current_target -> $target"
+        ln -s "$skill_dir" "$link_path"
+        log_warn "Fixed symlink $name -> $skill_dir"
       fi
     elif [ -e "$link_path" ]; then
-      log_err "$link_path exists but is not a symlink, skipping"
+      log_err "skills/$name exists but is not a symlink, skipping"
     else
-      mkdir -p "$target"
-      ln -s "$target" "$link_path"
-      log_ok "Created symlink $name -> $target"
+      ln -s "$skill_dir" "$link_path"
+      log_ok "Created symlink $name -> $skill_dir"
     fi
   done
 

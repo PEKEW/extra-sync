@@ -449,6 +449,284 @@ generate_report() {
 }
 
 # ──────────────────────────────────────────────
+# Diagnostics (shared by doctor + fix)
+# ──────────────────────────────────────────────
+
+# Resolve canonical SSOT skill dir for a name. Echoes path if found, else nothing.
+ssot_skill_path() {
+  local name="$1"
+  if [ -d "$AGENTS_CONFIG/common/skills/$name" ]; then
+    echo "$AGENTS_CONFIG/common/skills/$name"
+  elif [ -d "$AGENTS_CONFIG/special/claude/skills/$name" ]; then
+    echo "$AGENTS_CONFIG/special/claude/skills/$name"
+  fi
+}
+
+# Detect skill-link issues in ~/.claude/skills.
+# Emits TSV per issue: TYPE \t NAME \t DETAIL \t HINT
+detect_skill_issues() {
+  local skills_dir="$CLAUDE_DIR/skills"
+  [ -d "$skills_dir" ] || return 0
+  local entry name target
+  for entry in "$skills_dir"/*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    name=$(basename "$entry")
+    if [ -L "$entry" ]; then
+      target=$(readlink "$entry")
+      if [ ! -e "$entry" ]; then
+        printf '%s\t%s\t%s\t%s\n' "SKILL_DANGLING" "$name" "$target" "remove or repoint to SSOT"
+      elif [[ "$target" != "$AGENTS_CONFIG"/* ]]; then
+        printf '%s\t%s\t%s\t%s\n' "SKILL_WRONG_TARGET" "$name" "$target" "repoint to SSOT / import source"
+      fi
+    elif [ -d "$entry" ] && [ -f "$entry/SKILL.md" ]; then
+      # Real dir holding a skill — installed outside the extra-sync convention.
+      printf '%s\t%s\t%s\t%s\n' "SKILL_REAL_DIR" "$name" "$entry" "relocate into SSOT + symlink"
+    fi
+  done
+}
+
+# Detect SKILL.md frontmatter problems in SSOT skills (manual-fix only).
+detect_frontmatter_issues() {
+  local skill_md fm has_name has_desc name
+  for skill_md in "$AGENTS_CONFIG"/common/skills/*/SKILL.md "$AGENTS_CONFIG"/special/claude/skills/*/SKILL.md; do
+    [ -f "$skill_md" ] || continue
+    name=$(basename "$(dirname "$skill_md")")
+    if ! head -1 "$skill_md" | grep -q '^---'; then
+      printf '%s\t%s\t%s\t%s\n' "SKILL_FRONTMATTER" "$name" "no YAML frontmatter" "add name/description"
+      continue
+    fi
+    fm=$(awk 'NR==1 && /^---$/{f=1;next} f && /^---$/{exit} f' "$skill_md")
+    has_name=$(echo "$fm" | grep -c '^name:' || true)
+    has_desc=$(echo "$fm" | grep -c '^description:' || true)
+    if [ "$has_name" -eq 0 ] || [ "$has_desc" -eq 0 ]; then
+      printf '%s\t%s\t%s\t%s\n' "SKILL_FRONTMATTER" "$name" "missing name or description" "edit frontmatter"
+    fi
+  done
+}
+
+# Detect plugin/config issues: managed-plugins.json symlink, untracked plugins,
+# and enabled-flag drift between plugins.json (SSOT) and settings.json.
+detect_plugin_issues() {
+  local managed_plugins="$CLAUDE_DIR/managed-plugins.json"
+  local source_plugins="$AGENTS_CONFIG/special/claude/plugins/plugins.json"
+  local settings="$CLAUDE_DIR/settings.json"
+
+  if [ -L "$managed_plugins" ]; then
+    if [ "$(readlink "$managed_plugins")" != "$source_plugins" ]; then
+      printf '%s\t%s\t%s\t%s\n' "MANAGED_PLUGINS_BAD" "managed-plugins.json" "symlink -> $(readlink "$managed_plugins")" "repoint to plugins.json"
+    fi
+  elif [ -f "$managed_plugins" ]; then
+    printf '%s\t%s\t%s\t%s\n' "MANAGED_PLUGINS_BAD" "managed-plugins.json" "regular file, not symlink" "backup + symlink"
+  else
+    printf '%s\t%s\t%s\t%s\n' "MANAGED_PLUGINS_BAD" "managed-plugins.json" "missing" "create symlink"
+  fi
+
+  command -v jq &>/dev/null || return 0
+  [ -f "$source_plugins" ] && [ -f "$settings" ] || return 0
+
+  # Untracked: enabled in settings.json but absent from plugins.json
+  local key tracked
+  while IFS= read -r key; do
+    [ -z "$key" ] && continue
+    tracked=$(jq -r --arg k "$key" 'map(select(.key == $k)) | length' "$source_plugins")
+    if [ "$tracked" = "0" ]; then
+      printf '%s\t%s\t%s\t%s\n' "PLUGIN_UNTRACKED" "$key" "in settings.json, not in plugins.json" "append to plugins.json"
+    fi
+  done < <(jq -r '.enabledPlugins // {} | keys[]' "$settings")
+
+  # Drift: enabled flag mismatch between SSOT and settings.json
+  local src_enabled set_enabled
+  while IFS=$'\t' read -r key src_enabled; do
+    [ -z "$key" ] && continue
+    set_enabled=$(jq -r --arg k "$key" '.enabledPlugins[$k] // false' "$settings")
+    if [ "$src_enabled" != "$set_enabled" ]; then
+      printf '%s\t%s\t%s\t%s\n' "SETTINGS_DRIFT" "$key" "plugins.json=$src_enabled settings.json=$set_enabled" "align settings to SSOT"
+    fi
+  done < <(jq -r '.[] | [.key, (.enabled|tostring)] | @tsv' "$source_plugins")
+}
+
+# ──────────────────────────────────────────────
+# Doctor (read-only diagnosis)
+# ──────────────────────────────────────────────
+run_doctor() {
+  log_head "Doctor (read-only)"
+
+  local all
+  all=$(printf '%s\n%s\n%s\n' \
+    "$(detect_skill_issues || true)" \
+    "$(detect_frontmatter_issues || true)" \
+    "$(detect_plugin_issues || true)")
+
+  local type name detail hint
+  local skill_n=0 plugin_n=0 err_n=0 total=0
+  while IFS=$'\t' read -r type name detail hint; do
+    [ -z "${type:-}" ] && continue
+    total=$((total + 1))
+    case "$type" in
+      SKILL_*) skill_n=$((skill_n + 1)) ;;
+      *)       plugin_n=$((plugin_n + 1)) ;;
+    esac
+    case "$type" in
+      SKILL_DANGLING|MANAGED_PLUGINS_BAD)
+        log_err  "$type  $name — $detail  → $hint"; err_n=$((err_n + 1)) ;;
+      *)
+        log_warn "$type  $name — $detail  → $hint" ;;
+    esac
+  done <<< "$all"
+
+  echo ""
+  if [ "$total" -eq 0 ]; then
+    log_ok "No issues — everything organized per extra-sync convention"
+  else
+    log_info "Issues: $total total ($skill_n skills, $plugin_n plugins/config; $err_n broken)"
+    log_info "Run 'fix' to repair (mutates, backs up first)"
+  fi
+
+  DOCTOR_ERR_COUNT=$err_n
+  return 0
+}
+
+# ──────────────────────────────────────────────
+# Fix (mutating repair, with backups)
+# ──────────────────────────────────────────────
+run_fix() {
+  log_head "Fix (mutating)"
+
+  local scope_dir
+  if [ "${FIX_SCOPE:-common}" = "claude" ]; then
+    scope_dir="$AGENTS_CONFIG/special/claude/skills"
+  else
+    scope_dir="$AGENTS_CONFIG/common/skills"
+  fi
+  log_info "Relocate scope for off-SSOT skills: ${FIX_SCOPE:-common} ($scope_dir)"
+
+  local ts backups
+  ts=$(date +%Y%m%d-%H%M%S)
+  backups="$REPORT_DIR/fix-backups/$ts"
+
+  local skills_dir="$CLAUDE_DIR/skills"
+  local source_plugins="$AGENTS_CONFIG/special/claude/plugins/plugins.json"
+  local settings="$CLAUDE_DIR/settings.json"
+  local managed_plugins="$CLAUDE_DIR/managed-plugins.json"
+  local fixed=0 settings_backed=0
+
+  local all fm type name detail hint
+  all=$(printf '%s\n%s\n' \
+    "$(detect_skill_issues || true)" \
+    "$(detect_plugin_issues || true)")
+  fm=$(detect_frontmatter_issues || true)
+
+  while IFS=$'\t' read -r type name detail hint; do
+    [ -z "${type:-}" ] && continue
+    case "$type" in
+      SKILL_REAL_DIR)
+        local src="$detail" target="$scope_dir/$name" ssot
+        mkdir -p "$scope_dir"
+        if [ -e "$target" ]; then
+          mkdir -p "$backups"
+          cp -R "$src" "$backups/$name"
+          rm -rf "$src"
+          log_warn "SSOT already has '$name'; backed up off-SSOT copy to $backups/$name, removed it"
+        else
+          mv "$src" "$target"
+          log_ok "Relocated skill '$name' -> $target"
+        fi
+        ln -s "$target" "$skills_dir/$name"
+        log_ok "Linked skills/$name -> $target"
+        fixed=$((fixed + 1)) ;;
+      SKILL_DANGLING)
+        local ssot
+        ssot=$(ssot_skill_path "$name")
+        rm -f "$skills_dir/$name"
+        if [ -n "$ssot" ]; then
+          ln -s "$ssot" "$skills_dir/$name"
+          log_ok "Repointed dangling skills/$name -> $ssot"
+        else
+          log_ok "Removed dangling link skills/$name"
+        fi
+        fixed=$((fixed + 1)) ;;
+      SKILL_WRONG_TARGET)
+        local ssot
+        ssot=$(ssot_skill_path "$name")
+        if [ -n "$ssot" ]; then
+          rm -f "$skills_dir/$name"
+          ln -s "$ssot" "$skills_dir/$name"
+          log_ok "Repointed skills/$name -> $ssot (was $detail)"
+        else
+          mkdir -p "$scope_dir" "$backups"
+          cp -R "$detail" "$backups/$name.orig" 2>/dev/null || true
+          cp -R "$detail" "$scope_dir/$name"
+          rm -f "$skills_dir/$name"
+          ln -s "$scope_dir/$name" "$skills_dir/$name"
+          log_ok "Imported off-SSOT skill '$name' to $scope_dir/$name and relinked"
+        fi
+        fixed=$((fixed + 1)) ;;
+      MANAGED_PLUGINS_BAD)
+        if [ -L "$managed_plugins" ]; then
+          rm -f "$managed_plugins"
+        elif [ -f "$managed_plugins" ]; then
+          mkdir -p "$backups"
+          cp "$managed_plugins" "$backups/managed-plugins.json"
+          rm -f "$managed_plugins"
+        fi
+        ln -s "$source_plugins" "$managed_plugins"
+        log_ok "Normalized managed-plugins.json -> $source_plugins"
+        fixed=$((fixed + 1)) ;;
+      PLUGIN_UNTRACKED)
+        if ! command -v jq &>/dev/null; then
+          log_err "jq required to register '$name', skipping"
+        else
+          mkdir -p "$backups"
+          cp "$source_plugins" "$backups/plugins.json" 2>/dev/null || true
+          local key="$name" mkt repo mgr stype tmp
+          mkt="${key##*@}"
+          repo=$(jq -r --arg m "$mkt" '.extraKnownMarketplaces[$m].source.repo // empty' "$settings" 2>/dev/null || true)
+          if [ "$mkt" = "local" ]; then mgr="local"; stype="local"; else mgr="marketplace"; stype="github"; fi
+          tmp=$(mktemp)
+          jq --arg key "$key" --arg pname "${key%@*}" --arg repo "$repo" \
+             --arg mgr "$mgr" --arg stype "$stype" \
+             '. += [{
+                "agent":"claude","enabled":true,"git_commit":"",
+                "key":$key,"managed_by":$mgr,"name":$pname,"scope":"user",
+                "source_repo":(if $repo=="" then null else $repo end),
+                "source_type":$stype,"version":"unknown"
+              }]' "$source_plugins" > "$tmp" && mv "$tmp" "$source_plugins"
+          log_ok "Registered untracked plugin '$key' in plugins.json (repo=${repo:-none})"
+          fixed=$((fixed + 1))
+        fi ;;
+      SETTINGS_DRIFT)
+        if ! command -v jq &>/dev/null; then
+          log_err "jq required to align '$name', skipping"
+        else
+          if [ "$settings_backed" -eq 0 ]; then
+            mkdir -p "$backups"; cp "$settings" "$backups/settings.json"; settings_backed=1
+          fi
+          local key="$name" want tmp
+          want=$(jq -r --arg k "$key" '.[] | select(.key==$k) | .enabled' "$source_plugins")
+          tmp=$(mktemp)
+          jq --arg k "$key" --argjson v "$want" '.enabledPlugins[$k] = $v' "$settings" > "$tmp" && mv "$tmp" "$settings"
+          log_ok "Aligned settings.json enabledPlugins[$key] = $want"
+          fixed=$((fixed + 1))
+        fi ;;
+    esac
+  done <<< "$all"
+
+  if [ -n "$fm" ]; then
+    echo ""
+    log_warn "Frontmatter issues need manual edit (not auto-fixed):"
+    while IFS=$'\t' read -r type name detail hint; do
+      [ -z "${type:-}" ] && continue
+      log_warn "  $name: $detail"
+    done <<< "$fm"
+  fi
+
+  echo ""
+  log_ok "Fix applied $fixed change(s)."
+  [ "$fixed" -gt 0 ] && log_info "Backups (if any): $backups"
+  log_info "Re-run 'doctor' to confirm clean state"
+}
+
+# ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
 main() {
@@ -460,6 +738,19 @@ main() {
   local do_plugins=false
   local do_remote=false
   local do_report=false
+  local do_doctor=false
+  local do_fix=false
+  FIX_SCOPE=common
+
+  # Pre-pass: capture --scope <value>
+  local prev=""
+  for arg in "$@"; do
+    [ "$prev" = "--scope" ] && FIX_SCOPE="$arg"
+    prev="$arg"
+  done
+  if [ "$FIX_SCOPE" != "common" ] && [ "$FIX_SCOPE" != "claude" ]; then
+    echo "Invalid --scope: $FIX_SCOPE (use common|claude)"; exit 1
+  fi
 
   if [ $# -eq 0 ] || [[ " $* " == *" --all "* ]]; then
     do_pull=true
@@ -468,15 +759,23 @@ main() {
     do_remote=true
     do_report=true
   else
+    prev=""
     for arg in "$@"; do
+      # Consume the value token that follows --scope
+      if [ "$prev" = "--scope" ]; then prev="$arg"; continue; fi
       case "$arg" in
+        doctor)    do_doctor=true ;;
+        fix)       do_fix=true ;;
+        --scope)   : ;;
         --pull)    do_pull=true ;;
         --skills)  do_skills=true ;;
         --plugins) do_plugins=true ;;
         --remote)  do_remote=true ;;
         --report)  do_report=true ;;
+        --all)     do_pull=true; do_skills=true; do_plugins=true; do_remote=true; do_report=true ;;
         *)         echo "Unknown option: $arg"; exit 1 ;;
       esac
+      prev="$arg"
     done
   fi
 
@@ -491,9 +790,16 @@ main() {
   $do_plugins && sync_plugins
   $do_remote  && check_remote
   $do_report  && generate_report
+  $do_doctor  && run_doctor
+  $do_fix     && run_fix
 
   log_head "Done"
-  log_ok "Sync completed at $(date '+%Y-%m-%d %H:%M:%S')"
+  log_ok "Completed at $(date '+%Y-%m-%d %H:%M:%S')"
+
+  # doctor is CI-usable: non-zero exit when broken issues remain
+  if $do_doctor && [ "${DOCTOR_ERR_COUNT:-0}" -gt 0 ]; then
+    exit 1
+  fi
 }
 
 main "$@"

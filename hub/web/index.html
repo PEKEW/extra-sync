@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>extra-sync hub · Agent 配置面板</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="logo">⇄</span>
+    <div>
+      <h1>extra-sync hub</h1>
+      <span class="sub" id="report-line">加载中…</span>
+    </div>
+  </div>
+  <div class="actions">
+    <input id="filter" type="search" placeholder="过滤 skill / plugin…" autocomplete="off">
+    <button id="doctor-btn" title="只读诊断，不做任何修改">🩺 Doctor</button>
+    <button id="fix-btn" title="修复问题（会修改文件，先备份）">🔧 Fix</button>
+    <button id="remote-btn" title="检查 GitHub 远端更新">⬆ 检查更新</button>
+    <button id="sync-btn" title="完整同步：pull + skills + plugins + remote + report">☁️ 完整同步</button>
+    <button id="refresh" title="重新生成清单报告">↻ 刷新报告</button>
+  </div>
+</header>
+
+<main id="content">
+  <div class="loading">正在加载报告…</div>
+</main>
+
+<div id="toast" class="toast hidden"></div>
+
+<footer>extra-sync hub · SSOT <code>~/.agents-config</code> · 数据来自 <code>reports/sync-report-*.json</code> · 所有操作走 <code>sync.sh</code></footer>
+
+<script src="/app.js"></script>
+</body>
+</html>
